@@ -34,5 +34,18 @@ n_step: ${n_step}
 
 mixed_precision: false
 
+actor_pruner: ${actor_pruner}
 actor_sparsity: ${actor_sparsity}
+actor_update_frequency: ${actor_update_frequency}
+actor_start_step: ${actor_start_step}
+actor_end_step: ${actor_end_step}
+actor_sparsity_distribution: ${actor_sparsity_distribution}
+actor_drop_fraction: ${actor_drop_fraction}
+
+critic_pruner: ${critic_pruner}
 critic_sparsity: ${critic_sparsity}
+critic_update_frequency: ${critic_update_frequency}
+critic_start_step: ${critic_start_step}
+critic_end_step: ${critic_end_step}
+critic_sparsity_distribution: ${critic_sparsity_distribution}
+critic_drop_fraction: ${critic_drop_fraction}

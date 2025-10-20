@@ -11,7 +11,8 @@ from flax.core import freeze, unfreeze
 from scale_rl.networks.utils import tree_norm
 from scale_rl.agents.sparse import get_sparsities_erdos_renyi, get_var_shape_dict, create_mask
 PRNGKey = jnp.ndarray
-
+import jaxpruner
+from jaxpruner import base_updater
 
 @flax.struct.dataclass
 class Trainer:
@@ -20,10 +21,11 @@ class Trainer:
     tx: Optional[optax.GradientTransformation] = flax.struct.field(pytree_node=False)
     opt_state: Optional[optax.OptState] = None
     update_step: int = 0
-    dynamic_scale: Optional[dynamic_scale_lib.DynamicScale] = None
-    sparse: bool = flax.struct.field(default=False, pytree_node=False)
+    dynamic_scale: Optional[dynamic_scale_lib.DynamicScale] = None,
+    pruner: Optional[base_updater.BaseUpdater] = flax.struct.field(default=None, pytree_node=False)
+    # sparse: bool = flax.struct.field(default=False, pytree_node=False)
     #network_mask: Optional[flax.core.FrozenDict[str, Any]] = None  # Add this line
-    network_mask: Optional[flax.core.FrozenDict[str, Any]] = flax.struct.field(default=None, pytree_node=False)
+    # network_mask: Optional[flax.core.FrozenDict[str, Any]] = flax.struct.field(default=None, pytree_node=False)
     """
     dataclass decorator makes custom class to be passed safely to Jax.
     https://flax.readthedocs.io/en/latest/api_reference/flax.struct.html
@@ -45,18 +47,20 @@ class Trainer:
         network_inputs: flax.core.FrozenDict[str, jnp.ndarray],
         tx: Optional[optax.GradientTransformation] = None,
         dynamic_scale: Optional[dynamic_scale_lib.DynamicScale] = None,
-        sparse = False,
-        network_mask = None,
+        pruner: Optional[base_updater.BaseUpdater] = None,
+        # sparse = False,
+        # network_mask = None,
     ) -> "Trainer":
         variables = network_def.init(**network_inputs)
         params = variables.pop("params")
-        if sparse:
-            params_unfrozen = unfreeze(params)
-            mask_unfrozen = unfreeze(network_mask)
-            # set weight to zero
-            masked_params_unfrozen = jax.tree_util.tree_map(lambda p, m: p * m, params_unfrozen, mask_unfrozen)
-            params = freeze(masked_params_unfrozen)
+        # if sparse:
+        #     params_unfrozen = unfreeze(params)
+        #     mask_unfrozen = unfreeze(network_mask)
+        #     # set weight to zero
+        #     masked_params_unfrozen = jax.tree_util.tree_map(lambda p, m: p * m, params_unfrozen, mask_unfrozen)
+        #     params = freeze(masked_params_unfrozen)
         if tx is not None:
+            tx = pruner.wrap_optax(tx)
             opt_state = tx.init(params)
         else:
             opt_state = None
@@ -67,8 +71,9 @@ class Trainer:
             tx=tx,
             opt_state=opt_state,
             dynamic_scale=dynamic_scale,
-            sparse=sparse,
-            network_mask=network_mask
+            pruner=pruner,
+            # sparse=sparse,
+            # network_mask=network_mask
         )
 
         return network
@@ -88,18 +93,19 @@ class Trainer:
             grads, info = grad_fn(self.params)
             dynamic_scale = None
             is_fin = True
-        if self.sparse and self.network_mask is not None:
-            mask_grad = jax.tree.map(lambda u, m: u * m, grads, self.network_mask)
-            grad_norm = tree_norm(mask_grad)
-            info["grad_norm"] = grad_norm
-        else:
-            grad_norm = tree_norm(grads)
-            info["grad_norm"] = grad_norm
+        # if self.sparse and self.network_mask is not None:
+        #     mask_grad = jax.tree.map(lambda u, m: u * m, grads, self.network_mask)
+        #     grad_norm = tree_norm(mask_grad)
+        #     info["grad_norm"] = grad_norm
+        # else:
+        grad_norm = tree_norm(grads)
+        info["grad_norm"] = grad_norm
         # TODO adjust sparse gnorm
         updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
-        if self.sparse and self.network_mask is not None:
-            updates = jax.tree.map(lambda u, m: u * m, updates, self.network_mask)
+        # if self.sparse and self.network_mask is not None:
+        #     updates = jax.tree.map(lambda u, m: u * m, updates, self.network_mask)
         new_params = optax.apply_updates(self.params, updates)
+        new_params = self.pruner.post_gradient_update(new_params, new_opt_state)
 
         network = self.replace(
             params=jax.tree_util.tree_map(

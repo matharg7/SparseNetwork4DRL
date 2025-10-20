@@ -11,13 +11,28 @@ env_name: 'humanoid-walk'
 ##################################################################################
 # Training
 ##################################################################################
-actor_sparsity: 0.0
 actor_num_blocks: 1
 actor_hidden_dim: 128
 
-critic_sparsity: 0.0
 critic_num_blocks: 2
 critic_hidden_dim: 512
+
+actor_pruner: "magnitude"
+actor_sparsity: 0.95
+actor_update_frequency: 1500
+actor_start_step: 175000
+actor_end_step: 625000
+actor_sparsity_distribution: "erk"
+actor_drop_fraction: 0.5
+
+critic_pruner: "magnitude"
+critic_sparsity: 0.95
+critic_update_frequency: 1500
+critic_start_step: 175000
+critic_end_step: 625000
+critic_sparsity_distribution: "erk"
+critic_drop_fraction: 0.5
+
 # gamma value is set with a heuristic from TD-MPCv2
 eff_episode_len: ${eval:'${env.max_episode_steps} / ${env.action_repeat}'}
 gamma: ${eval:'max(min((${eff_episode_len} / 5 - 1) / (${eff_episode_len} / 5), 0.995), 0.95)'}

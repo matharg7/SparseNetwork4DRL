@@ -8,6 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import dynamic_scale
+import ml_collections
+import jaxpruner
+
+from scale_rl.agents.sparse_training_api import create_sparse_updater
 
 from scale_rl.agents.base_agent import BaseAgent
 from scale_rl.agents.sac.sac_network import (
@@ -67,8 +71,21 @@ class SACConfig:
 
     mixed_precision: bool
 
+    actor_pruner: str
     actor_sparsity: float
+    actor_update_frequency: int
+    actor_start_step: int
+    actor_end_step: int
+    actor_sparsity_distribution: str
+    actor_drop_fraction: float
+
+    critic_pruner: str
     critic_sparsity: float
+    critic_update_frequency: int
+    critic_start_step: int
+    critic_end_step: int
+    critic_sparsity_distribution: str
+    critic_drop_fraction: float
 
 
 # @functools.partial(
@@ -79,6 +96,32 @@ class SACConfig:
 #         "cfg",
 #     ),
 # )
+
+def create_jaxpruner_configs(config):
+    actor_jaxpruner_config = ml_collections.ConfigDict()
+    actor_jaxpruner_config.algorithm = config.actor_pruner
+    actor_jaxpruner_config.sparsity = config.actor_sparsity
+    actor_jaxpruner_config.update_freq = config.actor_update_frequency
+    actor_jaxpruner_config.update_start_step = config.actor_start_step
+    actor_jaxpruner_config.update_end_step = config.actor_end_step
+    actor_jaxpruner_config.dist_type = config.actor_sparsity_distribution
+    actor_jaxpruner_config.drop_fraction = config.actor_drop_fraction
+
+    critic_jaxpruner_config = ml_collections.ConfigDict()
+    critic_jaxpruner_config.algorithm = config.critic_pruner
+    critic_jaxpruner_config.sparsity = config.critic_sparsity
+    critic_jaxpruner_config.update_freq = config.critic_update_frequency
+    critic_jaxpruner_config.update_start_step = config.critic_start_step
+    critic_jaxpruner_config.update_end_step = config.critic_end_step
+    critic_jaxpruner_config.dist_type = config.critic_sparsity_distribution
+    critic_jaxpruner_config.drop_fraction = config.critic_drop_fraction
+    
+    dense = ml_collections.ConfigDict()
+    dense.algorithm = "no_prune"
+
+    return actor_jaxpruner_config, critic_jaxpruner_config, dense
+
+
 def _init_sac_networks(
     observation_dim: int,
     action_dim: int,
@@ -88,14 +131,27 @@ def _init_sac_networks(
     fake_actions = jnp.zeros((1, action_dim))
 
     rng = jax.random.PRNGKey(cfg.seed)
-    rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
+    rng, actor_key, critic_key, temp_key, actor_rng_sparse, critic_rng_sparse = jax.random.split(rng, 6)
     compute_dtype = jnp.float16 if cfg.mixed_precision else jnp.float32
 
-    if cfg.actor_sparsity > 0.0:
-        actor_sparse = True
-    else:
-       actor_sparse = False
+    # if cfg.actor_sparsity > 0.0:
+    #     actor_sparse = True
+    # else:
+    #    actor_sparse = False
     # When initializing the network in the flax.nn.Module class, rng_key should be passed as rngs.
+    
+    # if actor_sparse:
+    actor_sparse_config, critic_sparse_config, dense = create_jaxpruner_configs(cfg)
+    
+    
+    actor_sparse_config.rng_seed = actor_rng_sparse
+    actor_pruner = create_sparse_updater(actor_sparse_config)
+    
+    critic_sparse_config.rng_seed = critic_rng_sparse
+    critic_pruner = create_sparse_updater(critic_sparse_config)
+
+    dense_pruner = create_sparse_updater(dense)
+
     actor_network_def=SACActor(
             block_type=cfg.actor_block_type,
             num_blocks=cfg.actor_num_blocks,
@@ -103,26 +159,31 @@ def _init_sac_networks(
             action_dim=action_dim,
             dtype=compute_dtype,
         )
-    _fake_actor_variables = actor_network_def.init(rng, fake_observations)
-    fake_actor_params = _fake_actor_variables['params']  # A FrozenDict of parameters
-    if actor_sparse:
-        actor_network_parm_dict = get_var_shape_dict(fake_actor_params)
-        actor_network_sparse = get_sparsities_erdos_renyi(actor_network_parm_dict, default_sparsity=float(cfg.actor_sparsity))
-        mask_rng = jax.random.PRNGKey(cfg.seed)
-        actor_network_mask = create_mask(fake_actor_params, actor_network_sparse, mask_rng)
-    else:
-        actor_network_mask = None
+    # _fake_actor_variables = actor_network_def.init(rng, fake_observations)
+    # fake_actor_params = _fake_actor_variables['params']  # A FrozenDict of parameters
+    # if actor_sparse:
+    #     actor_network_parm_dict = get_var_shape_dict(fake_actor_params)
+    #     actor_network_sparse = get_sparsities_erdos_renyi(actor_network_parm_dict, default_sparsity=float(cfg.actor_sparsity))
+    #     mask_rng = jax.random.PRNGKey(cfg.seed)
+    #     actor_network_mask = create_mask(fake_actor_params, actor_network_sparse, mask_rng)
+    # else:
+    #     actor_network_mask = None
+
+    actor_optimizer = optax.adamw(
+            learning_rate=cfg.actor_learning_rate,
+            weight_decay=cfg.actor_weight_decay,
+        )
+
+    # actor_optimizer = actor_pruner.wrap_optimizer(actor_optimizer)
 
     actor = Trainer.create(
         network_def=actor_network_def,
         network_inputs={"rngs": actor_key, "observations": fake_observations},
-        tx=optax.adamw(
-            learning_rate=cfg.actor_learning_rate,
-            weight_decay=cfg.actor_weight_decay,
-        ),
+        tx=actor_optimizer,
         dynamic_scale=dynamic_scale.DynamicScale() if cfg.mixed_precision else None,
-        sparse = actor_sparse,
-        network_mask = actor_network_mask
+        pruner=actor_pruner
+        # sparse = actor_sparse,
+        # network_mask = actor_network_mask
     )
 
 
@@ -140,20 +201,26 @@ def _init_sac_networks(
             hidden_dim=cfg.critic_hidden_dim,
             dtype=compute_dtype,
         )
-    _fake_critic_variables = critic_network_def.init(rng, observations=fake_observations, actions=fake_actions)
-    fake_critic_params = _fake_critic_variables['params']  # A FrozenDict of parameters
-    if cfg.actor_sparsity > 0.0:
-        critic_sparse = True
-    else:
-       critic_sparse = False
-    if critic_sparse:
-        critic_network_parm_dict = get_var_shape_dict(fake_critic_params)
-        critic_network_sparse = get_sparsities_erdos_renyi(critic_network_parm_dict, default_sparsity=float(cfg.critic_sparsity))
-        mask_rng = jax.random.PRNGKey(cfg.seed)
-        critic_network_mask = create_mask(fake_critic_params, critic_network_sparse, mask_rng)
-    else:
-        critic_network_mask = None
+    # _fake_critic_variables = critic_network_def.init(rng, observations=fake_observations, actions=fake_actions)
+    # fake_critic_params = _fake_critic_variables['params']  # A FrozenDict of parameters
+    # if cfg.actor_sparsity > 0.0:
+    #     critic_sparse = True
+    # else:
+    #    critic_sparse = False
+    # if critic_sparse:
+    #     critic_network_parm_dict = get_var_shape_dict(fake_critic_params)
+    #     critic_network_sparse = get_sparsities_erdos_renyi(critic_network_parm_dict, default_sparsity=float(cfg.critic_sparsity))
+    #     mask_rng = jax.random.PRNGKey(cfg.seed)
+    #     critic_network_mask = create_mask(fake_critic_params, critic_network_sparse, mask_rng)
+    # else:
+    #     critic_network_mask = None
+    critic_optimizer = optax.adamw(
+            learning_rate=cfg.critic_learning_rate,
+            weight_decay=cfg.critic_weight_decay,
+        )
 
+    # critic_optimizer = critic_pruner.wrap_optimizer(critic_optimizer)
+    
     critic = Trainer.create(
         network_def=critic_network_def,
         network_inputs={
@@ -161,13 +228,11 @@ def _init_sac_networks(
             "observations": fake_observations,
             "actions": fake_actions,
         },
-        tx=optax.adamw(
-            learning_rate=cfg.critic_learning_rate,
-            weight_decay=cfg.critic_weight_decay,
-        ),
+        tx=critic_optimizer,
         dynamic_scale=dynamic_scale.DynamicScale() if cfg.mixed_precision else None,
-        sparse = critic_sparse,
-        network_mask = critic_network_mask,
+        pruner=critic_pruner,
+        # sparse = critic_sparse,
+        # network_mask = critic_network_mask,
     )
 
     # we set target critic's parameters identical to critic by using same rng.
@@ -180,8 +245,9 @@ def _init_sac_networks(
             "actions": fake_actions,
         },
         tx=None,
-        sparse = critic_sparse,
-        network_mask = critic_network_mask,
+        pruner=dense_pruner
+        # sparse = critic_sparse,
+        # network_mask = critic_network_mask,
     )
 
     temperature = Trainer.create(
@@ -193,8 +259,9 @@ def _init_sac_networks(
             learning_rate=cfg.temp_learning_rate,
             weight_decay=cfg.temp_weight_decay,
         ),
-        sparse=False,
-        network_mask=None,
+        pruner=dense_pruner
+        # sparse=False,
+        # network_mask=None,
     )
 
     return rng, actor, critic, target_critic, temperature
@@ -304,7 +371,7 @@ class SACAgent(BaseAgent):
             action_space,
             cfg,
         )
-
+        print(cfg.items())
         # map dictionary to dataclass
         self._cfg = SACConfig(**cfg)
 
